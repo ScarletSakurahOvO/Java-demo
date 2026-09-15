@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>线程池实时监控看板</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 24px; }
+        
+        /* 顶部标题与控制区域 */
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid #334155; padding-bottom: 16px; }
+        .header-controls { display: flex; gap: 12px; align-items: center; }
+        
+        .status-badge { background: #10b98120; color: #10b981; padding: 6px 12px; border-radius: 20px; font-size: 14px; font-weight: bold; border: 1px solid #10b981; }
+        
+        /* 按钮基础与互斥状态样式 */
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .btn-success { background-color: #10b981; color: #ffffff; }
+        .btn-success:hover { background-color: #059669; }
+        .btn-success:disabled { background-color: #475569; cursor: not-allowed; opacity: 0.5; }
+
+        .btn-danger { background-color: #f43f5e; color: #ffffff; }
+        .btn-danger:hover { background-color: #e11d48; }
+        .btn-danger:disabled { background-color: #475569; cursor: not-allowed; opacity: 0.5; }
+
+        /* 核心指标卡片 Grid 布局 */
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+        .card-title { color: #94a3b8; font-size: 14px; margin-bottom: 8px; }
+        .card-value { font-size: 28px; font-weight: bold; color: #38bdf8; }
+        
+        /* 动态队列进度条 */
+        .progress-container { margin-top: 12px; background: #334155; height: 10px; border-radius: 5px; overflow: hidden; }
+        .progress-bar { background: #38bdf8; height: 100%; width: 0%; transition: width 0.3s ease, background-color 0.3s; }
+        
+        /* 日志黑色终端 */
+        .terminal { background: #020617; border-radius: 12px; padding: 16px; border: 1px solid #334155; font-family: monospace; }
+        .terminal-header { color: #64748b; font-size: 13px; margin-bottom: 12px; border-bottom: 1px solid #1e293b; padding-bottom: 8px; }
+        .log-list { height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+        .log-item { color: #a7f3d0; line-height: 1.4; }
+        .log-time { color: #64748b; margin-right: 8px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>MyFixedThreadPool 实时看板</h1>
+        <div class="header-controls">
+            <button class="btn btn-success" id="startBtn" onclick="sendStart()" disabled>启动线程池</button>
+            <button class="btn btn-danger" id="shutdownBtn" onclick="sendShutdown()">平滑停止线程池</button>
+            <span class="status-badge" id="poolStatus">● 运行中 (RUNNING)</span>
+        </div>
+    </div>
+
+    <!-- 1. 指标卡片面板 -->
+    <div class="metrics-grid">
+        <div class="card">
+            <div class="card-title">活跃线程 / 总线程</div>
+            <div class="card-value" id="activeThreads">0 / 0</div>
+        </div>
+        <div class="card">
+            <div class="card-title">任务队列使用率</div>
+            <div class="card-value" id="queueUsageText">0% (0/0)</div>
+            <div class="progress-container">
+                <div class="progress-bar" id="queueProgressBar"></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">已完成任务数</div>
+            <div class="card-value" id="completedTasks">0</div>
+        </div>
+        <div class="card">
+            <div class="card-title">拒绝任务数</div>
+            <div class="card-value" style="color: #f43f5e;" id="rejectedTasks">0</div>
+        </div>
+    </div>
+
+    <!-- 2. 日志终端面板 -->
+    <div class="terminal">
+        <div class="terminal-header">实时日志追踪 (Live Logs)</div>
+        <div class="log-list" id="logList">
+            <div class="log-item"><span class="log-time">[系统]</span> 看板初始化完成，正尝试与后端通信...</div>
+        </div>
+    </div>
+
+    <script>
+        // 核心监控指标对象
+        let metrics = { active: 0, total: 0, queueSize: 0, queueCapacity: 1, completed: 0, rejected: 0, isRunning: true };
+
+        // 渲染 UI 数据与进度条预警颜色
+        function updateUI() {
+            document.getElementById('activeThreads').innerText = `${metrics.active} / ${metrics.total}`;
+            document.getElementById('completedTasks').innerText = metrics.completed;
+            document.getElementById('rejectedTasks').innerText = metrics.rejected;
+
+            const queuePercent = metrics.queueCapacity > 0 ? Math.round((metrics.queueSize / metrics.queueCapacity) * 100) : 0;
+            document.getElementById('queueUsageText').innerText = `${queuePercent}% (${metrics.queueSize}/${metrics.queueCapacity})`;
+            
+            const progressBar = document.getElementById('queueProgressBar');
+            progressBar.style.width = `${queuePercent}%`;
+            progressBar.style.backgroundColor = queuePercent > 80 ? '#f43f5e' : (queuePercent > 50 ? '#fbbf24' : '#38bdf8');
+        }
+
+        // 追加单条日志并保持探底
+        function appendLog(message) {
+            const logList = document.getElementById('logList');
+            const time = new Date().toLocaleTimeString();
+            const logItem = document.createElement('div');
+            logItem.className = 'log-item';
+            logItem.innerHTML = `<span class="log-time">[${time}]</span> ${message}`;
+            logList.appendChild(logItem);
+            logList.scrollTop = logList.scrollHeight;
+        }
+
+        // 触发启动线程池接口
+        function sendStart() {
+            fetch('http://localhost:8080/api/start', { method: 'POST' })
+                .then(response => response.text())
+                .then(msg => {
+                    appendLog(`[SYSTEM] ${msg}`);
+                })
+                .catch(err => {
+                    alert('发送启动指令失败，请确保 Java 后端正在运行！');
+                    console.error(err);
+                });
+        }
+
+        // 触发平滑停止线程池接口
+        function sendShutdown() {
+            if (!confirm('确定要平滑关闭线程池吗？关闭后将拒绝后续新任务。')) {
+                return;
+            }
+
+            fetch('http://localhost:8080/api/shutdown', { method: 'POST' })
+                .then(response => response.text())
+                .then(msg => {
+                    appendLog(`[SYSTEM] ${msg}`);
+                })
+                .catch(err => {
+                    alert('发送关闭指令失败，请确保 Java 后端正在运行！');
+                    console.error(err);
+                });
+        }
+
+        // 500ms 轮询 API 接口
+        setInterval(() => {
+            fetch('http://localhost:8080/api/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    metrics = data;
+                    updateUI();
+
+                    const statusBadge = document.getElementById('poolStatus');
+                    const startBtn = document.getElementById('startBtn');
+                    const shutdownBtn = document.getElementById('shutdownBtn');
+
+                    // 根据后端 isRunning 状态切换按钮启用/禁用与徽章外观
+                    if (data.isRunning === false) {
+                        statusBadge.innerText = '● 已关闭 (SHUTDOWN)';
+                        statusBadge.style.color = '#f43f5e';
+                        statusBadge.style.borderColor = '#f43f5e';
+                        statusBadge.style.backgroundColor = '#f43f5e20';
+
+                        startBtn.disabled = false;    // 开启启动按钮
+                        shutdownBtn.disabled = true;   // 禁用停止按钮
+                    } else {
+                        statusBadge.innerText = '● 运行中 (RUNNING)';
+                        statusBadge.style.color = '#10b981';
+                        statusBadge.style.borderColor = '#10b981';
+                        statusBadge.style.backgroundColor = '#10b98120';
+
+                        startBtn.disabled = true;     // 禁用启动按钮
+                        shutdownBtn.disabled = false;  // 开启停止按钮
+                    }
+
+                    // 刷新日志列表
+                    if (data.logs && data.logs.length > 0) {
+                        const logList = document.getElementById('logList');
+                        logList.innerHTML = ''; 
+                        data.logs.forEach(msg => appendLog(msg));
+                    }
+                })
+                .catch(err => console.error("连接 Java 后端失败:", err));
+        }, 500);
+
+        updateUI();
+    </script>
+</body>
+</html>
